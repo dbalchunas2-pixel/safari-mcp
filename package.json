@@ -10,6 +10,9 @@
   },
   "scripts": {
     "start": "node index.js",
+    "start:remote": "SAFARI_MCP_HTTP=1 SAFARI_MCP_REMOTE=1 node index.js",
+    "start:hub": "node railway-hub.js",
+    "start:tunnel": "node tunnel-client.js",
     "test": "node --test --test-force-exit tests/*.test.js test/*.test.mjs",
     "lint": "eslint .",
     "format": "prettier --write .",
@@ -64,6 +67,8 @@
   "files": [
     "index.js",
     "transport.js",
+    "railway-hub.js",
+    "tunnel-client.js",
     "response.js",
     "safari.js",
     "session-context.js",
@@ -80,6 +85,8 @@
     "glama.json",
     "LICENSE",
     "README.md",
+    "Dockerfile.railway",
+    "deploy/",
     "scripts/postinstall.cjs"
   ],
   "dependencies": {
