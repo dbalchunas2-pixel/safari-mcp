@@ -1,0 +1,29 @@
+# Dockerfile.railway - Railway deployment for the Safari MCP Tunnel Hub
+# Only needs the railway-hub.js file + ws dependency (not the full safari-mcp).
+# The hub is a proxy - it forwards MCP requests through a WebSocket tunnel to the Mac.
+#
+# Build: docker build -f Dockerfile.railway -t safari-mcp-hub .
+# Deploy: Railway auto-detects this Dockerfile when present.
+
+FROM node:20-slim
+
+WORKDIR /app
+
+# Create a minimal package.json for the hub only.
+# This avoids the "os": ["darwin"] restriction in the main package.json
+# (Railway runs Linux, the hub doesn't need macOS - it's just a proxy).
+RUN echo '{"name":"safari-mcp-hub","version":"1.0.0","type":"module","dependencies":{"ws":"^8.19.0"}}' > package.json
+
+RUN npm install --production
+
+# Copy only the hub file - we don't need index.js, safari.js, etc.
+COPY railway-hub.js ./
+
+# Railway sets PORT automatically. The hub listens on 0.0.0.0:${PORT}.
+EXPOSE 3000
+
+# Health check (Railway can use this)
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD node -e "fetch('http://localhost:'+(process.env.PORT||3000)+'/health').then(r=>r.ok?process.exit(0):process.exit(1)).catch(()=>process.exit(1))"
+
+CMD ["node", "railway-hub.js"]
