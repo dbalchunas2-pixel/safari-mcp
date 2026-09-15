@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.dbalchunas.safari-mcp-tunnel</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <!-- IMPORTANT: Update this path to your actual node binary location. -->
+        <!-- Find it with: which node -->
+        <!-- Common locations: /usr/local/bin/node, /opt/homebrew/bin/node, ~/.nvm/versions/node/v20.x.x/bin/node -->
+        <string>/usr/local/bin/node</string>
+        <!-- IMPORTANT: Update this path to where you cloned safari-mcp -->
+        <string>/Users/davidbalchunas/safari-mcp/tunnel-client.js</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/davidbalchunas/safari-mcp</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- WebSocket URL of the Railway hub tunnel endpoint -->
+        <key>SAFARI_MCP_TUNNEL_URL</key>
+        <string>wss://safari-mcp-hub-production.up.railway.app/tunnel</string>
+
+        <!-- Shared secret between the Mac tunnel client and Railway hub -->
+        <!-- Generate with: openssl rand -hex 32 -->
+        <key>TUNNEL_TOKEN</key>
+        <string>REPLACE_WITH_YOUR_TUNNEL_TOKEN</string>
+
+        <!-- Local safari-mcp HTTP daemon port (must match hub's expectation) -->
+        <key>SAFARI_MCP_HTTP_PORT</key>
+        <string>9225</string>
+
+        <!-- Auto-spawn the local safari-mcp daemon -->
+        <key>SAFARI_MCP_SPAWN_DAEMON</key>
+        <string>1</string>
+
+        <!-- PATH so node can find npx and other tools if needed -->
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+    </dict>
+
+    <!-- Start at login / boot -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart automatically if the process crashes -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <!-- Restart delay (seconds) -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Logs -->
+    <key>StandardOutPath</key>
+    <string>/tmp/safari-mcp-tunnel.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/safari-mcp-tunnel.err</string>
+
+    <!-- Process type -->
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
