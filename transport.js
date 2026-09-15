@@ -1,6 +1,9 @@
 // Opt-in transport selection. Default (no env) = stdio, byte-for-byte the historical behaviour so
 // npm users and single-session use are unaffected. SAFARI_MCP_HTTP=1 switches to a shared HTTP
-// instance so many Claude Code sessions reuse ONE safari-mcp process. See docs/http-transport-design.md.
+// instance so many Claude Code sessions reuse ONE safari-mcp process.
+// SAFARI_MCP_REMOTE=1 (requires SAFARI_MCP_HTTP=1) binds 0.0.0.0 and enables bearer token auth
+// via SAFARI_MCP_KEY, so the daemon can be reached through a tunnel or reverse proxy.
+// See docs/http-transport-design.md.
 
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -16,10 +19,13 @@ const DEFAULT_HTTP_PORT = 9225; // distinct from the 9224 Safari-extension port
 export function planTransport(env = {}) {
   const flag = env.SAFARI_MCP_HTTP;
   if (flag && flag !== "0") {
+    const remote = env.SAFARI_MCP_REMOTE && env.SAFARI_MCP_REMOTE !== "0";
     return {
       kind: "http",
-      host: "127.0.0.1", // localhost-only bind — no auth needed, never exposed off-box
+      host: remote ? "0.0.0.0" : "127.0.0.1", // 0.0.0.0 for remote/tunnel access, localhost for local
       port: parseInt(env.SAFARI_MCP_HTTP_PORT || String(DEFAULT_HTTP_PORT), 10),
+      remote,
+      authKey: remote ? env.SAFARI_MCP_KEY : undefined,
     };
   }
   return { kind: "stdio" };
@@ -48,6 +54,25 @@ export async function startTransport(createMcpServer, env = process.env) {
 
   const httpServer = createServer(async (req, res) => {
     try {
+      // --- Bearer token auth (remote mode only) ---
+      // When SAFARI_MCP_REMOTE=1 and SAFARI_MCP_KEY is set, reject requests without a matching
+      // Authorization header. Local mode (127.0.0.1) skips auth entirely, preserving backward compat.
+      if (plan.remote && plan.authKey) {
+        const auth = req.headers["authorization"];
+        if (auth !== `Bearer ${plan.authKey}`) {
+          res.statusCode = 401;
+          res.setHeader("Content-Type", "application/json");
+          res.end(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              error: { code: -32000, message: "Unauthorized: invalid or missing bearer token" },
+              id: null,
+            })
+          );
+          return;
+        }
+      }
+
       let body;
       if (req.method === "POST") {
         const chunks = [];
@@ -106,6 +131,15 @@ export async function startTransport(createMcpServer, env = process.env) {
     httpServer.once("error", reject);
     httpServer.listen(plan.port, plan.host, resolve);
   });
+
+  if (plan.remote) {
+    console.error(
+      `safari-mcp HTTP listening on ${plan.host}:${plan.port} [REMOTE MODE] ` +
+      `bearer auth: ${plan.authKey ? "enabled" : "WARNING - SAFARI_MCP_KEY not set, auth disabled!"}`
+    );
+  } else {
+    console.error(`safari-mcp HTTP listening on ${plan.host}:${plan.port}`);
+  }
 
   return {
     kind: "http",
