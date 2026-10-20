@@ -11,6 +11,7 @@ import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
 import { sessionCtx } from "./session-context.js";
 import { _dropSession } from "./safari.js";
+import { getAsHealth } from "./as-guard.js";
 
 const DEFAULT_HTTP_PORT = 9225; // distinct from the 9224 Safari-extension port
 
@@ -54,6 +55,14 @@ export async function startTransport(createMcpServer, env = process.env) {
 
   const httpServer = createServer(async (req, res) => {
     try {
+      // --- Health check (no auth, for monitoring) ---
+      if (req.url === "/health") {
+        res.statusCode = 200;
+        res.setHeader("Content-Type", "application/json");
+        res.end(JSON.stringify(getAsHealth()));
+        return;
+      }
+
       // --- Bearer token auth (remote mode only) ---
       // When SAFARI_MCP_REMOTE=1 and SAFARI_MCP_KEY is set, reject requests without a matching
       // Authorization header. Local mode (127.0.0.1) skips auth entirely, preserving backward compat.

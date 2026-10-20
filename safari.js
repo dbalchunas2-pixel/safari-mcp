@@ -15,10 +15,12 @@ import { VIEWPORT_SCRIPT, SAFE_AREA_SCRIPT, PWA_SCRIPT, WEBKIT_COMPAT_SCRIPT, AL
 import { escJsSingleQuote, escAppleScriptString } from "./injected-escape.js";
 import { currentSessionId } from "./session-context.js";
 import { allowUserTabs } from "./ownership-state.js";
+import { asHealth, setProbeFn, incrementKillCount, probeSafari } from "./as-guard.js";
 // Extension bridge is handled by index.js (WebSocket server on port 9223)
 
 const execFileAsync = promisify(execFile);
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const AS_TIMEOUT_MS = parseInt(process.env.SAFARI_MCP_AS_TIMEOUT_MS || "20000", 10);
 // ========== STRING ESCAPING (single source of truth) ==========
 // Escaping ORDER is security-relevant: the backslash MUST be escaped before the quote, or the
 // backslash inserted in front of the quote gets doubled and the string breaks out. These helpers
@@ -44,8 +46,32 @@ let _helperConsecutiveTimeouts = 0; // Track consecutive timeouts — kill thres
 // but it eliminates the response/callback desync that made tab resolution
 // silently return the wrong tab when the user was browsing concurrently.
 let _helperLock = Promise.resolve();
+let _helperQueueDepth = 0;
 function _withHelperLock(makePromise) {
-  const result = _helperLock.then(makePromise, makePromise);
+  _helperQueueDepth++;
+  asHealth.queueDepth = _helperQueueDepth;
+  const queuedAt = Date.now();
+  const run = async () => {
+    _helperQueueDepth--;
+    asHealth.queueDepth = _helperQueueDepth;
+    const queueWait = Date.now() - queuedAt;
+    if (queueWait > AS_TIMEOUT_MS) {
+      throw new Error(`AppleScript queue wait exceeded budget (waited ${queueWait}ms, budget ${AS_TIMEOUT_MS}ms)`);
+    }
+    // Post-kill probe: if Safari was marked unresponsive, probe before accepting
+    if (asHealth.safariUnresponsive) {
+      const probeOk = await probeSafari();
+      if (!probeOk) throw new Error("safari unresponsive");
+      asHealth.safariUnresponsive = false;
+    }
+    asHealth.inflight++;
+    try {
+      return await makePromise();
+    } finally {
+      asHealth.inflight--;
+    }
+  };
+  const result = _helperLock.then(run, run);
   _helperLock = result.then(() => {}, () => {});
   return result;
 }
@@ -82,6 +108,23 @@ function startHelper() {
 }
 
 startHelper();
+
+// ========== SAFARI RESPONSIVENESS PROBE ==========
+// Used by as-guard.js after a killed AppleScript call. Uses osascript subprocess
+// (NOT osascriptFast) because the helper may have just been SIGKILLed.
+async function _safariProbe() {
+  try {
+    const { stdout } = await execFileAsync("osascript", ["-e", 'tell application "Safari" to get name of document 1'], {
+      timeout: 3000,
+      maxBuffer: 1024,
+      killSignal: "SIGKILL",
+    });
+    return !!stdout.trim();
+  } catch {
+    return false;
+  }
+}
+setProbeFn(_safariProbe);
 
 // ========== AUTO-RESTART: recover from helper crashes ==========
 let _restartCount = 0;
@@ -789,17 +832,20 @@ async function resolveActiveTab() {
 // Optimization: for runJS we write to temp file and execute (avoids arg escaping).
 
 // Run AppleScript — uses execFile (safe, isolated, for complex scripts)
-async function osascript(script, { timeout = 10000 } = {}) {
+async function osascript(script, { timeout = AS_TIMEOUT_MS } = {}) {
   if (!(await isSafariRunning())) throw safariNotRunningError();
   // Save frontmost app via daemon BEFORE subprocess (~0.1ms)
   // Skip if an outer caller (extensionOrFallback) already handles focus
   const shouldGuardFocus = !_focusGuardActive;
   const frontApp = shouldGuardFocus ? await _helperGetFrontApp() : null;
   try {
+    const _asStart = Date.now();
     const { stdout } = await execFileAsync("osascript", ["-e", script], {
       timeout,
       maxBuffer: 10 * 1024 * 1024,
+      killSignal: "SIGKILL",
     });
+    asHealth.lastAsDurationMs = Date.now() - _asStart;
     return stdout.trim();
   } catch (err) {
     // Retry once if the window ID became stale (window reopened/changed)
@@ -808,10 +854,11 @@ async function osascript(script, { timeout = 10000 } = {}) {
       await refreshTargetWindow(true);
       if (_targetWindowRef !== oldRef) {
         const retryScript = script.replace(new RegExp(oldRef.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), _targetWindowRef);
-        const { stdout } = await execFileAsync("osascript", ["-e", retryScript], { timeout, maxBuffer: 10 * 1024 * 1024 });
+        const { stdout } = await execFileAsync("osascript", ["-e", retryScript], { timeout, maxBuffer: 10 * 1024 * 1024, killSignal: "SIGKILL" });
         return stdout.trim();
       }
     }
+    if (err.killed || err.signal === "SIGKILL") incrementKillCount();
     throw new Error(`AppleScript error: ${err.stderr || err.message}`);
   } finally {
     // Awaited restore — caller must not return to user-space while Safari is still frontmost.
@@ -822,7 +869,7 @@ async function osascript(script, { timeout = 10000 } = {}) {
 }
 
 // osascriptFast: uses persistent Swift daemon (~5ms) — 18x faster than subprocess (~90ms)
-async function osascriptFast(script, { timeout = 10000, noFocusGuard = false } = {}) {
+async function osascriptFast(script, { timeout = AS_TIMEOUT_MS, noFocusGuard = false } = {}) {
   if (!(await isSafariRunning())) throw safariNotRunningError();
   if (!_helperProc) startHelper();
 
@@ -868,26 +915,18 @@ function _osascriptFastHelper(script, timeout) {
     const timer = setTimeout(() => {
       if (resolved) return;
       resolved = true;
-      // DON'T remove from queue — replace with a proof-of-life consumer to maintain
-      // FIFO order. A heavy page (e.g. the Airtable SPA) makes `do JavaScript` legitimately
-      // slow: the call exceeds `timeout`ms, but the helper IS alive and emits its response a
-      // moment later. That late response proves liveness — so when it arrives we reset the
-      // consecutive-timeout counter instead of discarding the signal. Killing the daemon on a
-      // slow page is pointless (the fresh daemon hits the same slow page) and disruptive.
-      // Only a helper that NEVER replies (truly hung) accumulates timeouts with no late reply.
+      // SIGKILL the helper on timeout — the only trustworthy cancellation (known bug 1).
+      // A slow page will cause a kill+restart, but leaving a stuck helper blocks ALL
+      // subsequent requests (known bug 2). The post-kill probe verifies Safari responsiveness.
       const idx = _helperQueue.indexOf(cb);
-      if (idx >= 0) _helperQueue[idx] = () => { _helperConsecutiveTimeouts = 0; }; // late reply ⇒ alive
-      _helperConsecutiveTimeouts++;
-      if (_helperConsecutiveTimeouts >= 5) {
-        console.error(`[Safari MCP] safari-helper: ${_helperConsecutiveTimeouts} consecutive timeouts with no late replies — killing daemon`);
-        _helperProc?.kill();
-        _helperProc = null;
-        _helperConsecutiveTimeouts = 0;
-        // The killed proc's 'exit' handler also schedules a restart; guard the timer so only
-        // one respawn wins (startHelper is now idempotent too) — no second, orphaned daemon.
-        setTimeout(() => { if (!_shuttingDown && !_helperProc) startHelper(); }, 100);
-      }
-      reject(new Error("safari-helper timeout"));
+      if (idx >= 0) _helperQueue[idx] = () => {}; // no-op consumer for any late reply
+      console.error(`[Safari MCP] safari-helper timeout (${timeout}ms) — SIGKILL and restart`);
+      _helperProc?.kill("SIGKILL");
+      _helperProc = null;
+      _helperConsecutiveTimeouts = 0;
+      incrementKillCount();
+      setTimeout(() => { if (!_shuttingDown && !_helperProc) startHelper(); }, 100);
+      reject(new Error(`safari-helper timeout (${timeout}ms)`));
     }, timeout);
 
     function cb(line) {
