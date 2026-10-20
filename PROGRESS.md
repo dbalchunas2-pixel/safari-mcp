@@ -33,3 +33,25 @@ Status: COMPLETE - Gate 1 PASSED
 
 ### If resuming, start here:
 Phase 0 and 1 complete. Start Phase 2 (hub hardening, deploy-gated).
+
+## Phase 2: Hub Hardening (deploy-gated)
+Status: LOCAL TESTS PASSED - ready to deploy
+Commit: pending
+
+### Changes
+- railway-hub.js: UPSTREAM_TIMEOUT_MS=55s (per-request, was TUNNEL_TIMEOUT_MS=60s)
+- railway-hub.js: enriched /health (tunnelConnected, lastHeartbeatAt, inflight, totalRequests, totalErrors, lastError, uptime)
+- railway-hub.js: 503 with JSON body when tunnel disconnected (not empty)
+- railway-hub.js: /ping endpoint (unauthenticated, for keep-alive)
+- railway-hub.js: JSON-line request logging (reqId, method, duration, outcome)
+- railway-hub.js: lastHeartbeatAt tracked on heartbeat
+- Wire protocol backward compatible: no changes to request/response/heartbeat message formats
+
+### Gate 2 (local)
+(i) 70s upstream -> timeout at 55043ms with JSON-RPC error, tunnel stays connected ✅
+(ii) tunnel disconnected -> /mcp 503 with JSON, /health 503 with JSON ✅
+
+### Backward Compatibility
+- Wire protocol messages unchanged (request, response, heartbeat, heartbeat-ack)
+- New fields are server-side health state only
+- Old tunnel client will work against new hub

@@ -30,7 +30,28 @@ let tunnelClient = null;
 // Map<requestId, { resolve, reject, timeout }>
 const pendingRequests = new Map();
 
-const TUNNEL_TIMEOUT_MS = 60_000; // 60s - Safari AppleScript can be slow
+const TUNNEL_TIMEOUT_MS = 60_000; // 60s - tunnel-alive timeout (must be > UPSTREAM_TIMEOUT_MS)
+const UPSTREAM_TIMEOUT_MS = 55_000; // 55s - per-request upstream timeout
+
+// Hub health state
+const hubHealth = {
+  totalRequests: 0,
+  totalErrors: 0,
+  lastError: null,
+  lastErrorAt: null,
+  lastHeartbeatAt: null,
+  inflight: 0,
+  startTime: Date.now(),
+};
+
+// JSON-line request logger
+function logRequest(reqId, method, duration, outcome, extra = {}) {
+  console.log(JSON.stringify({
+    ts: new Date().toISOString(),
+    type: 'request',
+    reqId, method, duration, outcome, ...extra,
+  }));
+}
 
 // ---------------------------------------------------------------------------
 // HTTP server: MCP endpoint for Littlebird and other cloud MCP clients
@@ -38,12 +59,43 @@ const TUNNEL_TIMEOUT_MS = 60_000; // 60s - Safari AppleScript can be slow
 const httpServer = createServer(async (req, res) => {
   // Health check endpoint (no auth, for Railway uptime monitoring)
   if (req.url === "/health") {
+    const tunnelConnected = tunnelClient !== null && tunnelClient.readyState === 1;
+    res.setHeader("Content-Type", "application/json");
+    if (!tunnelConnected) {
+      res.statusCode = 503;
+      res.end(JSON.stringify({
+        status: "offline",
+        tunnelConnected: false,
+        lastHeartbeatAt: hubHealth.lastHeartbeatAt,
+        inflight: hubHealth.inflight,
+        totalRequests: hubHealth.totalRequests,
+        totalErrors: hubHealth.totalErrors,
+        lastError: hubHealth.lastError,
+        lastErrorAt: hubHealth.lastErrorAt,
+        uptime: Math.round((Date.now() - hubHealth.startTime) / 1000),
+      }));
+    } else {
+      res.statusCode = 200;
+      res.end(JSON.stringify({
+        status: "ok",
+        tunnelConnected: true,
+        lastHeartbeatAt: hubHealth.lastHeartbeatAt,
+        inflight: hubHealth.inflight,
+        totalRequests: hubHealth.totalRequests,
+        totalErrors: hubHealth.totalErrors,
+        lastError: hubHealth.lastError,
+        lastErrorAt: hubHealth.lastErrorAt,
+        uptime: Math.round((Date.now() - hubHealth.startTime) / 1000),
+      }));
+    }
+    return;
+  }
+
+  // Unauthenticated ping endpoint for external keep-alive (prevents Railway cold starts)
+  if (req.url === "/ping") {
     res.statusCode = 200;
     res.setHeader("Content-Type", "application/json");
-    res.end(JSON.stringify({
-      status: "ok",
-      tunnelConnected: tunnelClient !== null && tunnelClient.readyState === 1,
-    }));
+    res.end(JSON.stringify({ ok: true, ts: new Date().toISOString() }));
     return;
   }
 
@@ -103,6 +155,9 @@ const httpServer = createServer(async (req, res) => {
 
     // Forward through tunnel
     const requestId = randomUUID();
+    hubHealth.totalRequests++;
+    hubHealth.inflight++;
+    const reqStartTime = Date.now();
     const forwardHeaders = { ...req.headers };
     // Strip auth header - the local daemon doesn't need it (localhost, no auth)
     delete forwardHeaders["authorization"];
@@ -116,6 +171,10 @@ const httpServer = createServer(async (req, res) => {
         headers: forwardHeaders,
         body: rawBody, // Send raw body string - local daemon will parse it
       });
+
+      hubHealth.inflight--;
+      const duration = Date.now() - reqStartTime;
+      logRequest(requestId, 'POST', duration, tunnelResponse.status >= 400 ? 'error' : 'ok', { status: tunnelResponse.status });
 
       res.statusCode = tunnelResponse.status || 200;
       // Forward relevant headers from the local daemon
@@ -133,6 +192,12 @@ const httpServer = createServer(async (req, res) => {
       res.end(tunnelResponse.rawBody || JSON.stringify(tunnelResponse.body || {}));
     } catch (err) {
       console.error(`Tunnel forwarding error for request ${requestId}:`, err.message);
+      hubHealth.inflight--;
+      hubHealth.totalErrors++;
+      hubHealth.lastError = err.message;
+      hubHealth.lastErrorAt = new Date().toISOString();
+      const duration = Date.now() - reqStartTime;
+      logRequest(requestId, 'POST', duration, 'error', { error: err.message });
       res.statusCode = 502;
       res.setHeader("Content-Type", "application/json");
       res.end(JSON.stringify({
@@ -217,7 +282,8 @@ wsServer.on("connection", (ws, req) => {
         pendingRequests.delete(msg.id);
         resolve(msg);
       } else if (msg.type === "heartbeat") {
-        // Tunnel client heartbeat - just keep the connection alive
+        // Tunnel client heartbeat - update lastHeartbeatAt
+        hubHealth.lastHeartbeatAt = new Date().toISOString();
         ws.send(JSON.stringify({ type: "heartbeat-ack" }));
       }
     } catch (e) {
@@ -228,6 +294,8 @@ wsServer.on("connection", (ws, req) => {
   ws.on("close", (code, reason) => {
     console.log(`Tunnel client disconnected: ${code} ${reason?.toString() || ""}`);
     if (tunnelClient === ws) tunnelClient = null;
+    hubHealth.lastError = `Tunnel disconnected: ${code}`;
+    hubHealth.lastErrorAt = new Date().toISOString();
     // Reject all pending requests - the Mac went away
     for (const [id, { reject, timeout }] of pendingRequests) {
       clearTimeout(timeout);
@@ -248,8 +316,8 @@ function forwardThroughTunnel(id, request) {
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       pendingRequests.delete(id);
-      reject(new Error(`Tunnel request timeout (${TUNNEL_TIMEOUT_MS / 1000}s)`));
-    }, TUNNEL_TIMEOUT_MS);
+      reject(new Error(`Tunnel upstream timeout (${UPSTREAM_TIMEOUT_MS / 1000}s)`));
+    }, UPSTREAM_TIMEOUT_MS);
 
     pendingRequests.set(id, { resolve, reject, timeout });
     tunnelClient.send(JSON.stringify({ type: "request", id, ...request }));
