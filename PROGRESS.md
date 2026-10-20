@@ -2,42 +2,34 @@
 
 ## Phase 0: Daemon Hard Timeout + Queue + Health
 Status: COMPLETE - Gate 0 PASSED
+Commit: 77020cb
 
-### Changes Made
-- [x] as-guard.js: health state, probe function, kill counter, getAsHealth
-- [x] safari.js: import as-guard, AS_TIMEOUT_MS env var (default 20s)
-- [x] safari.js: osascript() killSignal SIGKILL + health tracking
-- [x] safari.js: _osascriptFastHelper SIGKILL on first timeout (was 5th)
-- [x] safari.js: _withHelperLock queue depth tracking + queue-wait budget + post-kill probe
-- [x] safari.js: Safari probe function (osascript subprocess, 3s timeout)
-- [x] safari.js: osascriptFast() default timeout = AS_TIMEOUT_MS
-- [x] transport.js: /health endpoint (no auth, enriched JSON)
-- [x] package.json: as-guard.js added to files array
+### Changes
+- as-guard.js: health state, probe, kill counter, getAsHealth
+- safari.js: SIGKILL on timeout (osascript + helper), AS_TIMEOUT_MS env (20s), queue+probe in _withHelperLock
+- transport.js: /health endpoint (no auth)
+- package.json: as-guard.js in files
 
-### Gate 0 Evidence
+### Gate 0
+(i) Hang + recovery: SIGKILL fires, killCount++, next request succeeds ✅
+(ii) 50 sequential calls: zero hangs ✅
+(iii) stdio mode: unchanged ✅
 
-**Gate 0 (i): Hang simulation + recovery**
-- Tested with daemon running at AS_TIMEOUT_MS=3000 (3s)
-- safari_navigate to example.com triggered safari-helper timeout (10000ms)
-- killCount incremented from 0 to 1 (helper was SIGKILLed)
-- Helper auto-restarted within 100ms
-- Next request (safari_list_tabs) succeeded in 655ms
-- PASS ✅
+## Phase 1: Tunnel Client Circuit Breaker + Daemon Supervision
+Status: COMPLETE - Gate 1 PASSED
 
-**Gate 0 (ii): 50 sequential calls**
-- 50 sequential safari_list_tabs calls against normal pages
-- All 50 succeeded, zero hangs, 82-96s total
-- PASS ✅
+### Changes
+- tunnel-client.js: circuit breaker (3 failures -> open, 10s cooldown -> probe)
+- tunnel-client.js: daemon kill+restart on breaker trip (SIGKILL + spawnLocalDaemon)
+- tunnel-client.js: jitter on reconnect backoff (0-30% jitter, known bug 8 fix)
+- tunnel-client.js: FORWARD_TIMEOUT_MS constant (55s, was hardcoded)
+- tunnel-client.js: JSON-line state logging (breaker open/closed, reconnect, daemon restart)
+- tunnel-client.js: breaker tracks success/failure on all response paths
 
-**Gate 0 (iii): stdio mode unchanged**
-- `node -e "import('./index.js')"` loads without errors
-- PASS ✅
-
-### Notes
-- Safari's own JS engine has a ~10s timeout for `do JavaScript`, so pure JS busy-loops complete before our 20s timeout. The hard timeout is a backstop for when Safari itself is unresponsive (heavy SPA pages, Safari frozen).
-- The _osascriptFastHelper now SIGKILLs on first timeout (was 5th), which is more aggressive but prevents one stuck request from blocking all subsequent ones (known bug 2).
-- The post-kill probe (osascript subprocess calling `get name of document 1`) runs before the next helper request to verify Safari is responsive.
-- The _withHelperLock queue tracks depth and enforces queue-wait budget (fail fast if queued too long).
+### Gate 1
+(i) Daemon killed -> 3 requests fail fast (2ms each) -> daemon restarted (new PID) -> breaker closes -> request succeeds (1.8s) ✅
+(ii) WS killed -> reconnect within 5s -> hub tunnelConnected=true ✅
+(iii) launchctl kickstart -> PID changed (79872->80045) -> KeepAlive holds ✅
 
 ### If resuming, start here:
-Phase 0 is complete and committed. Start Phase 1 (tunnel client circuit breaker + daemon supervision).
+Phase 0 and 1 complete. Start Phase 2 (hub hardening, deploy-gated).

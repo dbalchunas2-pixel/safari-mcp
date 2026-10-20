@@ -49,6 +49,67 @@ const HEARTBEAT_INTERVAL_MS = 25_000; // Send heartbeat every 25s (Railway idle 
 
 let heartbeatTimer = null;
 
+// Circuit breaker state
+const BREAKER_THRESHOLD = 3;       // consecutive failures to open
+const BREAKER_COOLDOWN_MS = 10_000;  // cooldown before probe
+const FORWARD_TIMEOUT_MS = 55_000;  // per-forward timeout (must be < hub's 60s)
+let breakerFailures = 0;
+let breakerOpen = false;
+let breakerOpenedAt = 0;
+let lastRequestSeq = 0;
+
+// JSON-line logger for state transitions
+function logState(event, extra = {}) {
+  console.error(JSON.stringify({ ts: new Date().toISOString(), event, ...extra }));
+}
+
+// Circuit breaker helpers
+function breakerCanForward() {
+  if (!breakerOpen) return true;
+  // Check if cooldown has elapsed
+  if (Date.now() - breakerOpenedAt >= BREAKER_COOLDOWN_MS) {
+    logState('breaker_probe', { reason: 'cooldown elapsed' });
+    return true; // Allow one probe
+  }
+  return false;
+}
+
+function breakerRecordSuccess() {
+  if (breakerOpen) {
+    logState('breaker_closed', { failures: breakerFailures });
+    breakerOpen = false;
+    breakerFailures = 0;
+  } else {
+    breakerFailures = 0;
+  }
+}
+
+function breakerRecordFailure(reqId, reason) {
+  breakerFailures++;
+  logState('breaker_failure', { reqId, reason, consecutive: breakerFailures });
+  if (breakerFailures >= BREAKER_THRESHOLD && !breakerOpen) {
+    breakerOpen = true;
+    breakerOpenedAt = Date.now();
+    logState('breaker_open', { reason, failures: breakerFailures });
+    // Kill and restart the daemon
+    restartLocalDaemon();
+  }
+}
+
+function restartLocalDaemon() {
+  logState('daemon_restart', { reason: 'breaker trip' });
+  if (localDaemon) {
+    try { localDaemon.kill('SIGKILL'); } catch {}
+    localDaemon = null;
+  }
+  // Wait a moment then respawn
+  setTimeout(() => {
+    if (ws && ws.readyState === 1) {
+      spawnLocalDaemon();
+    }
+  }, 500);
+}
+
 // ---------------------------------------------------------------------------
 // Local daemon management
 // ---------------------------------------------------------------------------
@@ -129,6 +190,7 @@ function connect() {
   ws.on("open", () => {
     console.log("Tunnel connected to Railway hub");
     reconnectDelay = 1000; // Reset exponential backoff on successful connect
+    logState('tunnel_connected', { url: TUNNEL_URL });
 
     if (SPAWN_DAEMON) {
       // Wait a moment for the tunnel to stabilize, then spawn the local daemon
@@ -159,6 +221,7 @@ function connect() {
   ws.on("close", (code, reason) => {
     const reasonStr = reason?.toString() || "";
     console.log(`Tunnel disconnected: code=${code} ${reasonStr}`);
+    logState('tunnel_disconnected', { code, reason: reasonStr });
     stopHeartbeat();
     if (code === 4001) {
       console.error("Tunnel rejected: invalid TUNNEL_TOKEN. Check that it matches the Railway hub config.");
@@ -175,13 +238,17 @@ function connect() {
 }
 
 function scheduleReconnect() {
+  // Add jitter to prevent thundering-herd reconnect storms (known bug 8)
+  const jitter = Math.random() * 0.3 * reconnectDelay; // 0-30% jitter
+  const delay = reconnectDelay + jitter;
   if (reconnectDelay < MAX_RECONNECT_DELAY) {
-    console.log(`Reconnecting in ${reconnectDelay / 1000}s...`);
+    console.log(`Reconnecting in ${(delay / 1000).toFixed(1)}s (base=${reconnectDelay / 1000}s + jitter=${(jitter / 1000).toFixed(1)}s)...`);
   }
+  logState('reconnect_scheduled', { delayMs: Math.round(delay), baseMs: reconnectDelay });
   setTimeout(() => {
     reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY);
     connect();
-  }, reconnectDelay);
+  }, delay);
 }
 
 function startHeartbeat() {
@@ -205,6 +272,22 @@ function stopHeartbeat() {
 // ---------------------------------------------------------------------------
 function handleTunnelRequest(msg) {
   const { id, method, headers, body } = msg;
+  const seq = ++lastRequestSeq;
+
+  // Circuit breaker check
+  if (!breakerCanForward()) {
+    logState('breaker_rejected', { reqId: id, seq });
+    sendTunnelResponse(id, {
+      status: 503,
+      headers: { "content-type": "application/json" },
+      rawBody: JSON.stringify({
+        jsonrpc: "2.0",
+        error: { code: -32000, message: "local daemon unhealthy (circuit breaker open)" },
+        id: null,
+      }),
+    });
+    return;
+  }
 
   // Build request to local daemon
   const reqHeaders = { ...headers };
@@ -225,16 +308,23 @@ function handleTunnelRequest(msg) {
       method: method,
       headers: reqHeaders,
       path: "/mcp",
-      timeout: 55_000, // Slightly less than the hub's 60s timeout
+      timeout: FORWARD_TIMEOUT_MS,
     },
     (res) => {
       const chunks = [];
       res.on("data", (c) => chunks.push(c));
       res.on("end", () => {
         const rawBody = Buffer.concat(chunks).toString("utf8");
+        const status = res.statusCode || 200;
+        // Circuit breaker: track success/failure
+        if (status >= 500) {
+          breakerRecordFailure(id, `daemon returned ${status}`);
+        } else {
+          breakerRecordSuccess();
+        }
         // Send response back through tunnel
         sendTunnelResponse(id, {
-          status: res.statusCode || 200,
+          status,
           headers: res.headers,
           rawBody,
         });
@@ -256,6 +346,7 @@ function handleTunnelRequest(msg) {
 
   req.on("error", (err) => {
     console.error(`Local request error for ${id}:`, err.message);
+    breakerRecordFailure(id, `connection error: ${err.code || err.message}`);
     const errorMsg = err.code === "ECONNREFUSED"
       ? `Local daemon not running on ${LOCAL_HOST}:${LOCAL_PORT}. ` +
         (SPAWN_DAEMON ? "Daemon may still be starting up." : "SAFARI_MCP_SPAWN_DAEMON=0 - daemon not auto-spawned.")
@@ -273,6 +364,7 @@ function handleTunnelRequest(msg) {
 
   req.on("timeout", () => {
     console.error(`Local request timeout for ${id}`);
+    breakerRecordFailure(id, 'forward timeout');
     req.destroy();
     sendTunnelResponse(id, {
       status: 504,
